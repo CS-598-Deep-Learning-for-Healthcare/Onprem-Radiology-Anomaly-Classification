@@ -1,30 +1,46 @@
 import fnmatch
 import os
-import openai  # for calling the OpenAI API
-from numpy import dot  # for cosine similarity
+import openai
+from numpy import dot
 import numpy as np
 import json
 import backoff
 import time
 from collections import deque
+from dotenv import load_dotenv  # <-- NEW
+
+# Load environment variables from .env
+load_dotenv()
 
 # models
 EMBEDDING_MODEL = "text-embedding-ada-002"
 GPT_MODEL = "gpt-3.5-turbo"
-openai.api_key = "YOUR API"
-path = "MIMIC PATH HERE" ## mimic path
 
-def folder_load(backup = 0, saved_deque = None):
+# Get API key from env var (with a friendly error)
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY is not set. Put it in a .env file or your env.")
+openai.api_key = api_key
+
+path = "mimic_cxr_data/"  # mimic path
+
+
+def folder_load(backup=0, saved_deque=None):
     if backup == 0:
-        folder_list = [name for name in os.listdir(path) if os.path.isdir(os.path.join(path, name))]
+        folder_list = [
+            name for name in os.listdir(path)
+            if os.path.isdir(os.path.join(path, name))
+        ]
         folder_deque = deque(folder_list)
-        print(len(folder_list))
+        print("Number of folders:", len(folder_list))
     else:
-        saved_deque = np.load(saved_deque)
+        saved_deque = np.load(saved_deque, allow_pickle=True)
         folder_list = list(saved_deque)
         folder_deque = deque(folder_list)
+        print("Loaded remaining folders:", len(folder_list))
 
     return folder_list, folder_deque
+
 
 @backoff.on_exception(backoff.expo, openai.error.RateLimitError)
 def json_gpt(input: str):
@@ -33,17 +49,18 @@ def json_gpt(input: str):
         messages=[
             {"role": "system", "content": "You will be provided with a emr sentecne."},
             {"role": "user", "content": input},
-            ],
+        ],
         temperature=0.8,
     )
     text = completion.choices[0].message.content
     parsed = json.loads(text)
     return parsed
 
+
 @backoff.on_exception(backoff.expo, openai.error.RateLimitError)
-def get_embedding(text, model="text-embedding-ada-002"):
-   text = text.replace("\n", " ")
-   return openai.Embedding.create(input = [text], model=model)['data'][0]['embedding']
+def get_embedding(text, model=EMBEDDING_MODEL):
+    text = text.replace("\n", " ")
+    return openai.Embedding.create(input=[text], model=model)["data"][0]["embedding"]
 
 
 if __name__ == "__main__":
@@ -55,12 +72,19 @@ if __name__ == "__main__":
     dataset2 = []
 
     try:
-        trouble_file = list(np.load('trouble_para_train.npy'))
+        trouble_file = list(np.load("trouble_para_train.npy", allow_pickle=True))
     except:
         trouble_file = []
 
-    folder_list, folder_deque = folder_load(backup = 1, saved_deque = 'remain_folders.npy')
-    print(len(folder_list))
+    # fresh run vs resume
+    if os.path.exists("remain_folders.npy"):
+        folder_list, folder_deque = folder_load(
+            backup=1, saved_deque="remain_folders.npy"
+        )
+    else:
+        folder_list, folder_deque = folder_load()
+
+    print("Total folders to process:", len(folder_list))
 
     for folder_name in folder_list:
         if folder_count >= 1000:
