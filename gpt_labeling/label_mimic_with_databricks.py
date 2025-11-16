@@ -22,7 +22,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
-DATABRICKS_CHAT_ENDPOINT = "databricks-llama-4-maverick"
+DATABRICKS_CHAT_ENDPOINT = "databricks-qwen3-next-80b-a3b-instruct"
 DATABRICKS_EMBEDDING_ENDPOINT = os.getenv(
     "DATABRICKS_EMBEDDING_ENDPOINT",
     "databricks-gte-large-en"  # default; override in .env if needed
@@ -49,7 +49,7 @@ client = OpenAI(
 PARQUET_DIR = "mimic_cxr_data"
 
 # Safety / debugging knobs
-API_CALL_BUDGET = 20          # total Chat + Embedding calls
+API_CALL_BUDGET = 5          # total Chat + Embedding calls
 MAX_FILES = 1                 # how many parquet shards to process (for testing)
 MAX_ROWS_PER_FILE = 5         # max reports per file (for testing)
 MAX_SENTENCES_PER_REPORT = 3  # max sentences per report (for testing)
@@ -98,7 +98,10 @@ def json_gpt(input: str):
         ],
         temperature=0.8,
     )
+    print("[json_gpt] LLM call complete.")
     text = completion.choices[0].message.content
+    print("text complete, text is of type :", type(text))
+    print("text: ", text)
     print("[json_gpt] Raw LLM output:", text[:120].replace("\n", " "), "...", flush=True)
 
     try:
@@ -106,7 +109,6 @@ def json_gpt(input: str):
     except json.JSONDecodeError as e:
         print("[json_gpt] JSON decode error, text was:", text, flush=True)
         raise e
-
     return parsed
 
 
