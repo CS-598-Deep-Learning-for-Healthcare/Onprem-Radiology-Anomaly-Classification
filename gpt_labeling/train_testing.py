@@ -10,17 +10,20 @@ from numpy import dot
 import openai
 import backoff
 from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+
 
 load_dotenv()
 
-
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 # ==============================
 # CONFIG
 # ==============================
 
 # Models
 EMBEDDING_MODEL = "text-embedding-ada-002"
-GPT_MODEL = "gpt-3.5-turbo"
+GPT_MODEL = "GPT5-nano"
+# GPT_MODEL = "llama-3.3-70b-versatile"
 
 # Directory containing Parquet shards like train-00000-of-00002.parquet
 PARQUET_DIR = "mimic_cxr_data"
@@ -33,15 +36,29 @@ API_CALL_BUDGET = 20  # <-- change this to test with more/less calls
 # API KEY SETUP
 # ==============================
 
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise RuntimeError(
-        "OPENAI_API_KEY environment variable is not set. "
-        "Set it in your shell or a .env file before running."
-    )
+# GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# if not GROQ_API_KEY:
+#     raise RuntimeError(
+#         "GROQ_API_KEY environment variable is not set. "
+#         "Set it in your shell or a .env file before running."
+#     )
 
-openai.api_key = api_key
 
+
+# openai.api_key = GROQ_API_KEY
+# openai.api_base = "https://api.groq.com/openai/v1"
+
+openai.api_key = DATABRICKS_TOKEN
+openai.api_base = "https://dbc-0005fb62-4075.cloud.databricks.com/serving-endpoints"
+
+try:
+    model = SentenceTransformer('BAAI/bge-m3')
+except Exception as e:
+    print(f"Error loading model: {e}")
+    print("Please ensure 'sentence-transformers' is installed (`pip install sentence-transformers`)")
+    exit()
+
+IS_LOCAL_EMBEDDING = True  # Set to True to use local embeddings
 
 # ==============================
 # CALL BUDGET TRACKING
@@ -78,7 +95,7 @@ def json_gpt(input: str):
     completion = openai.ChatCompletion.create(
         model=GPT_MODEL,
         messages=[
-            {"role": "system", "content": "You will be provided with a emr sentecne."},
+            {"role": "system", "content": "You will be provided with a emr sentence."},
             {"role": "user", "content": input},
         ],
         temperature=0.8,
@@ -98,6 +115,12 @@ def get_embedding(text, model=EMBEDDING_MODEL):
         input=[text],
         model=model
     )["data"][0]["embedding"]
+
+def get_embedding_local(text, model=EMBEDDING_MODEL):
+    # Count this call against the budget
+
+    text = text.replace("\n", " ")
+    return model.encode(text)
 
 
 # ==============================
@@ -199,8 +222,12 @@ if __name__ == "__main__":
                         try:
                             response = json_gpt(query)
                             response["Context"] = sentence
-                            context_emb = get_embedding(response["Context"])
-                            explanation_emb = get_embedding(response["Explanation"])
+                            if IS_LOCAL_EMBEDDING:
+                                context_emb = get_embedding_local(response["Context"])
+                                explanation_emb = get_embedding_local(response["Explanation"])
+                            else:
+                                context_emb = get_embedding(response["Context"])
+                                explanation_emb = get_embedding(response["Explanation"])
                             cosine_sim = (dot(context_emb, explanation_emb) + 1) / 2
                             response["confidence"] = cosine_sim
                             response["parquet_file"] = pf
@@ -229,8 +256,12 @@ if __name__ == "__main__":
                         try:
                             response = json_gpt(query)
                             response["Context"] = sentence
-                            context_emb = get_embedding(response["Context"])
-                            explanation_emb = get_embedding(response["Explanation"])
+                            if IS_LOCAL_EMBEDDING:
+                                context_emb = get_embedding_local(response["Context"])
+                                explanation_emb = get_embedding_local(response["Explanation"])
+                            else:
+                                context_emb = get_embedding(response["Context"])
+                                explanation_emb = get_embedding(response["Explanation"])
                             cosine_sim = (dot(context_emb, explanation_emb) + 1) / 2
                             response["confidence"] = cosine_sim
                             response["parquet_file"] = pf
@@ -259,8 +290,12 @@ if __name__ == "__main__":
                         try:
                             response = json_gpt(query)
                             response["Context"] = sentence
-                            context_emb = get_embedding(response["Context"])
-                            explanation_emb = get_embedding(response["Explanation"])
+                            if IS_LOCAL_EMBEDDING:
+                                context_emb = get_embedding_local(response["Context"])
+                                explanation_emb = get_embedding_local(response["Explanation"])
+                            else:
+                                context_emb = get_embedding(response["Context"])
+                                explanation_emb = get_embedding(response["Explanation"])
                             cosine_sim = (dot(context_emb, explanation_emb) + 1) / 2
                             response["confidence"] = cosine_sim
                             response["parquet_file"] = pf
