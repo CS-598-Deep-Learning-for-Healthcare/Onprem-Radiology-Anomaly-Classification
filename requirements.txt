@@ -8,8 +8,10 @@ numpy==1.26.0
 scikit-learn==1.2.2
 tqdm==4.65.0
 datasets==2.13.1
-openai==0.28.1
+openai>=1.0.0
 matplotlib
 python-dotenv
 pyarrow
 backoff
+tiktoken
+databricks-sdk
