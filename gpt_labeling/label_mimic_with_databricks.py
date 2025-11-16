@@ -22,7 +22,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+<<<<<<< HEAD
 DATABRICKS_CHAT_ENDPOINT = "databricks-qwen3-next-80b-a3b-instruct"
+=======
+DATABRICKS_CHAT_ENDPOINT = "databricks-gpt-oss-120b"
+>>>>>>> 28dc61d2e2b0494ba9964b4a4b1c16e1738405e0
 DATABRICKS_EMBEDDING_ENDPOINT = os.getenv(
     "DATABRICKS_EMBEDDING_ENDPOINT",
     "databricks-gte-large-en"  # default; override in .env if needed
@@ -46,7 +50,8 @@ client = OpenAI(
 # CONFIG
 # =============================================================================
 
-PARQUET_DIR = "mimic_cxr_data"
+# PARQUET_DIR = "mimic_cxr_data"
+PARQUET_DIR = "G:\Jupyterstuff\CS598DLH\Onprem-Radiology-Anomaly-Classification\mimic_cxr_data"
 
 # Safety / debugging knobs
 API_CALL_BUDGET = 5          # total Chat + Embedding calls
@@ -99,10 +104,26 @@ def json_gpt(input: str):
         temperature=0.8,
     )
     print("[json_gpt] LLM call complete.")
+<<<<<<< HEAD
     text = completion.choices[0].message.content
     print("text complete, text is of type :", type(text))
     print("text: ", text)
     print("[json_gpt] Raw LLM output:", text[:120].replace("\n", " "), "...", flush=True)
+=======
+    # print(completion)
+    raw_content = completion.choices[0].message.content
+    #different versions of libraries may have this as a string or list
+    text = ""
+    if isinstance(raw_content, list):
+        for item in raw_content:
+            print("item:", item)
+            if isinstance(item, dict) and item.get('type') == 'text' and 'text' in item:
+                text = item['text']
+                break
+    elif isinstance(raw_content, str):
+        text = raw_content
+    print("[json_gpt] Raw LLM output:", text[:120].replace("\n", " "), "...")
+>>>>>>> 28dc61d2e2b0494ba9964b4a4b1c16e1738405e0
 
     try:
         parsed = json.loads(text)
@@ -229,19 +250,19 @@ if __name__ == "__main__":
                     )
 
                     query = f"""Use the below sentence to answer the subsequent question.
-Emr_report:
-\"\"\" 
-{sentence}
-\"\"\" 
-Question: Does the patient have the specific disease in the chest based on the provied EMR report's sentence? 
-Answer form should be JSON object like following script. The JSON object has two key, "Result", and "Explanation".
-For [Result], if the sentence doesn't have enough information or evidence to classify, you should return "Uncertain". 
-If the sentence has the clear evidence that indicates absence of any abnormalities in chest, you should answer "No". 
-If the sentence has the clear observational evidence that indicates presence of any abnormalities in chest (only for present), you should answer "Yes". 
+                                Emr_report:
+                                \"\"\" 
+                                {sentence}
+                                \"\"\" 
+                                Question: Does the patient have the specific disease in the chest based on the provied EMR report's sentence? 
+                                Answer form should be JSON object like following script. The JSON object has two key, "Result", and "Explanation".
+                                For [Result], if the sentence doesn't have enough information or evidence to classify, you should return "Uncertain". 
+                                If the sentence has the clear evidence that indicates absence of any abnormalities in chest, you should answer "No". 
+                                If the sentence has the clear observational evidence that indicates presence of any abnormalities in chest (only for present), you should answer "Yes". 
 
-For [Explanation], you should give a sentence more than 40 letters and less than 60 letters which explain the reason about why you choose those answers. You should elucidating the rationale behind your choice, not a direct repetition, of the input text.
-[Result] : Uncertain / No / Yes
-"""
+                                For [Explanation], you should give a sentence more than 40 letters and less than 60 letters which explain the reason about why you choose those answers. You should elucidating the rationale behind your choice, not a direct repetition, of the input text.
+                                [Result] : Uncertain / No / Yes
+                                """
 
                     error_count = 0
 
@@ -268,6 +289,9 @@ For [Explanation], you should give a sentence more than 40 letters and less than
                         except Exception as e:
                             error_count += 1
                             print(f"[PASS 1] Error (attempt {error_count}): {e}", flush=True)
+                            #print stacktrace
+                            import traceback
+                            traceback.print_exc()
                             time.sleep(2)
                             continue
 
