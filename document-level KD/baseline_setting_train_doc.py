@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, BertForSequenceClassification
 
 
 ##### load RadBERT 
-model_name = 'zzxslp/RadBERT-RoBERTa-4m'
+model_name = 'emilyalsentzer/Bio_ClinicalBERT'
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model=BertForSequenceClassification.from_pretrained(model_name, num_labels=2, output_hidden_states=True, problem_type = "single_label_classification")
 dataset = load_dataset("json", data_files="./dataset/binary_label_paragraph.json")
