@@ -22,7 +22,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+<<<<<<< HEAD
+DATABRICKS_CHAT_ENDPOINT = "databricks-qwen3-next-80b-a3b-instruct"
+=======
 DATABRICKS_CHAT_ENDPOINT = "databricks-gpt-oss-120b"
+>>>>>>> 28dc61d2e2b0494ba9964b4a4b1c16e1738405e0
 DATABRICKS_EMBEDDING_ENDPOINT = os.getenv(
     "DATABRICKS_EMBEDDING_ENDPOINT",
     "databricks-gte-large-en"  # default; override in .env if needed
@@ -50,7 +54,7 @@ client = OpenAI(
 PARQUET_DIR = "G:\Jupyterstuff\CS598DLH\Onprem-Radiology-Anomaly-Classification\mimic_cxr_data"
 
 # Safety / debugging knobs
-API_CALL_BUDGET = 20          # total Chat + Embedding calls
+API_CALL_BUDGET = 5          # total Chat + Embedding calls
 MAX_FILES = 1                 # how many parquet shards to process (for testing)
 MAX_ROWS_PER_FILE = 5         # max reports per file (for testing)
 MAX_SENTENCES_PER_REPORT = 3  # max sentences per report (for testing)
@@ -100,6 +104,12 @@ def json_gpt(input: str):
         temperature=0.8,
     )
     print("[json_gpt] LLM call complete.")
+<<<<<<< HEAD
+    text = completion.choices[0].message.content
+    print("text complete, text is of type :", type(text))
+    print("text: ", text)
+    print("[json_gpt] Raw LLM output:", text[:120].replace("\n", " "), "...", flush=True)
+=======
     # print(completion)
     raw_content = completion.choices[0].message.content
     #different versions of libraries may have this as a string or list
@@ -113,6 +123,7 @@ def json_gpt(input: str):
     elif isinstance(raw_content, str):
         text = raw_content
     print("[json_gpt] Raw LLM output:", text[:120].replace("\n", " "), "...")
+>>>>>>> 28dc61d2e2b0494ba9964b4a4b1c16e1738405e0
 
     try:
         parsed = json.loads(text)

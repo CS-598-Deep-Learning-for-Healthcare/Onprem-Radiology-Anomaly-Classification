@@ -4,6 +4,8 @@ import torch
 from dotenv import load_dotenv
 from databricks import sql
 
+epoch_count = 20
+
 print("CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("GPU name:", torch.cuda.get_device_name(0))
@@ -79,71 +81,74 @@ from transformers import AutoTokenizer, BertForSequenceClassification
 from torch.optim import AdamW
 from tqdm.auto import tqdm
 
-model_name = "zzxslp/RadBERT-RoBERTa-4m"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+# model_name = "zzxslp/RadBERT-RoBERTa-4m"
+model_names = ["emilyalsentzer/Bio_ClinicalBERT", "microsoft/deberta-v3-base", "zzxslp/RadBERT-RoBERTa-4m"]
 
-encodings = tokenizer(
-    texts,
-    truncation=True,
-    padding="max_length",
-    max_length=120,
-    return_tensors="pt"
-)
+for model_name in model_names:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-class CXDataset(Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        padding="max_length",
+        max_length=120,
+        return_tensors="pt"
+    )
 
-    def __getitem__(self, idx):
-        item = {k:v[idx] for k,v in self.encodings.items()}
-        item["labels"] = torch.tensor(self.labels[idx]).long()
-        return item
+    class CXDataset(Dataset):
+        def __init__(self, encodings, labels):
+            self.encodings = encodings
+            self.labels = labels
 
-    def __len__(self):
-        return len(self.labels)
+        def __getitem__(self, idx):
+            item = {k:v[idx] for k,v in self.encodings.items()}
+            item["labels"] = torch.tensor(self.labels[idx]).long()
+            return item
 
-dataset = CXDataset(encodings, labels)
-dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+        def __len__(self):
+            return len(self.labels)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Using device:", device)
+    dataset = CXDataset(encodings, labels)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
 
-model = BertForSequenceClassification.from_pretrained(
-    model_name,
-    num_labels=2,
-    output_hidden_states=True
-)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Using device:", device)
 
-model.to(device)
-optimizer = AdamW(model.parameters(), lr=4e-5)
+    model = BertForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=2,
+        output_hidden_states=True
+    )
 
-# -----------------------------
-# 6. Simple training loop
-# -----------------------------
-for epoch in range(3):
-    total_loss = 0
-    model.train()
+    model.to(device)
+    optimizer = AdamW(model.parameters(), lr=4e-5)
 
-    loop = tqdm(dataloader, desc=f"Epoch {epoch+1}")
-    for batch in loop:
-        batch = {k:v.to(device) for k,v in batch.items()}
-        output = model(**batch)
+    # -----------------------------
+    # 6. Simple training loop
+    # -----------------------------
+    for epoch in range(epoch_count):
+        total_loss = 0
+        model.train()
 
-        loss = output.loss
-        loss.backward()
-        optimizer.zero_grad()
-        optimizer.step()
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        for batch in loop:
+            batch = {k:v.to(device) for k,v in batch.items()}
+            output = model(**batch)
 
-        total_loss += loss.item()
-        loop.set_postfix(loss=loss.item())
+            loss = output.loss
+            loss.backward()
+            optimizer.zero_grad()
+            optimizer.step()
 
-    print(f"Epoch {epoch+1} loss: {total_loss/len(dataloader):.4f}")
+            total_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
 
-# -----------------------------
-# 7. Save model locally
-# -----------------------------
-model.save_pretrained("./radbert_local")
-tokenizer.save_pretrained("./radbert_local")
+        print(f"Epoch {epoch+1} loss: {total_loss/len(dataloader):.4f}")
 
-print("Model saved to ./radbert_local")
+    # -----------------------------
+    # 7. Save model locally
+    # -----------------------------
+    model.save_pretrained(f"./{model_name}_local")
+    tokenizer.save_pretrained(f"./{model_name}_local")
+
+    print(f"Model saved to ./{model_name}_local")
