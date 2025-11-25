@@ -3,12 +3,14 @@ import torch
 import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
+from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import AutoTokenizer, BertForSequenceClassification, AutoModel, AutoConfig
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModel, AutoConfig
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from databricks import sql
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 
 # Import your custom loss
 from document_level_kd.losses import SupConLoss
@@ -46,31 +48,41 @@ def load_data_from_databricks():
         access_token=DATABRICKS_TOKEN,
     )
 
-    query = """
-    SELECT
-        subject_id, study_id, findings, impression, label, confidence
+    # --- Train Query ---
+    train_query = """
+    SELECT subject_id, study_id, findings, impression, label, confidence
     FROM workspace.default.mimic_cxr_train_set_label_explanation_consensus_v1
-    WHERE findings IS NOT NULL
-      AND impression IS NOT NULL
+    WHERE findings IS NOT NULL AND impression IS NOT NULL
       AND label IN ('Normal', 'Abnormal')
     """
 
-    print("Querying data...")
-    df = pd.read_sql(query, connection)
+    # --- Test Query ---
+    test_query = """
+    SELECT subject_id, study_id, findings, impression, label, confidence
+    FROM workspace.default.mimic_cxr_test_set_label_explanation_consensus_v1
+    WHERE findings IS NOT NULL AND impression IS NOT NULL
+      AND label IN ('Normal', 'Abnormal')
+    """
+
+    print("Querying Train data...")
+    df_train = pd.read_sql(train_query, connection)
+    print("Querying Test data...")
+    df_test = pd.read_sql(test_query, connection)
     connection.close()
     
-    # Preprocessing
-    df["Context"] = (df["findings"].fillna("") + " " + df["impression"].fillna("")).str.strip()
-    df = df[df["Context"].str.len() > 0]
+    # Helper to clean and map
+    def process_df(df):
+        df["Context"] = (df["findings"].fillna("") + " " + df["impression"].fillna("")).str.strip()
+        df = df[df["Context"].str.len() > 0]
+        label_map = {"Normal": 0, "Abnormal": 1}
+        df["Result"] = df["label"].map(label_map)
+        return df["Context"].tolist(), df["Result"].tolist()
+
+    train_texts, train_labels = process_df(df_train)
+    test_texts, test_labels = process_df(df_test)
     
-    label_map = {"Normal": 0, "Abnormal": 1}
-    df["Result"] = df["label"].map(label_map)
-    
-    texts = df["Context"].tolist()
-    labels = df["Result"].tolist()
-    
-    print(f"Data loaded. Rows: {len(df)}")
-    return texts, labels
+    print(f"Data loaded. Train: {len(train_texts)}, Test: {len(test_texts)}")
+    return train_texts, train_labels, test_texts, test_labels
 
 # -----------------------------
 # 2. Shared Utilities & Classes
@@ -82,7 +94,6 @@ class EMRDataset(Dataset):
         self.labels = labels
 
     def __getitem__(self, idx):
-        # Allow accessing keys regardless of tokenizer output format
         item = {key: val[idx] for key, val in self.encodings.items()}
         item['labels'] = torch.tensor(self.labels[idx]).long()
         return item
@@ -100,25 +111,92 @@ class MLP(nn.Module):
         return self.fc1(x)
 
 def get_clean_name(model_path):
-    """Sanitize model path for folder creation (e.g. 'org/model' -> 'org_model')"""
+    """Sanitize model path for folder creation"""
     return model_path.replace("/", "_")
+
+def evaluate_model(model, dataloader, device, split_name, is_mlp=False, encoder=None):
+    """
+    Generic evaluation loop for both Baseline (Full Model) and MLP (Last Layer).
+    """
+    model.eval()
+    if encoder: encoder.eval() # Ensure encoder is eval mode if using MLP
+    
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"EVAL ({split_name})"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch.pop('labels')
+            
+            if is_mlp and encoder is not None:
+                # MLP Path: Pass through Encoder -> Mean Pool -> MLP
+                outputs = encoder(**batch)
+                features = torch.mean(outputs.last_hidden_state, dim=1)
+                logits = model(features)
+            else:
+                # Standard Baseline Path
+                outputs = model(**batch)
+                logits = outputs.logits
+
+            batch_preds = logits.argmax(-1).detach().cpu().numpy()
+            batch_labels = labels.detach().cpu().numpy()
+
+            all_preds.extend(batch_preds)
+            all_labels.extend(batch_labels)
+
+    acc = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average="binary", zero_division=0
+    )
+    cm = confusion_matrix(all_labels, all_preds)
+    tn, fp, fn, tp = cm.ravel()
+
+    print(f"\n{split_name.upper()} RESULTS:")
+    print(f"Acc: {acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
+    print(f"CM: \n{cm}")
+
+    return {
+        "accuracy": acc, "precision": precision, "recall": recall, "f1": f1,
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp
+    }
+
+def save_metrics_to_csv(metrics, model_name, method_tag):
+    """Saves metrics to a CSV file named based on the model family."""
+    clean_name = get_clean_name(model_name)
+    filename = f"{clean_name}_metrics.csv"
+    filepath = os.path.join(SAVE_DIR, filename)
+    
+    row = {
+        "run_timestamp_utc": datetime.utcnow().isoformat(),
+        "model_name": model_name,
+        "method": method_tag, # e.g., "Baseline", "Contrastive_MLP"
+        "num_epochs": EPOCH_COUNT,
+        "learning_rate": LEARNING_RATE
+    }
+    row.update(metrics)
+    
+    df = pd.DataFrame([row])
+    
+    # Append if exists, else create new
+    if os.path.exists(filepath):
+        df.to_csv(filepath, mode='a', header=False, index=False)
+    else:
+        df.to_csv(filepath, index=False)
+    
+    print(f"Metrics saved to {filepath}")
 
 # -----------------------------
 # 3. Training Loops
 # -----------------------------
 
-def train_baseline(model_name, train_loader, device):
-    """
-    Standard Supervised Fine-Tuning
-    """
+def train_baseline(model_name, train_loader, test_loader, device):
+    """Standard Supervised Fine-Tuning"""
     print(f"\n[BASELINE] Starting training for {model_name}...")
     
-    # Initialize Model for Classification
-    model = BertForSequenceClassification.from_pretrained(
-        model_name, 
-        num_labels=2, 
-        output_hidden_states=True,
-        ignore_mismatched_sizes=True 
+    # Use AutoModelForSequenceClassification for broad compatibility (DeBERTa/BERT/RoBERTa)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=2, ignore_mismatched_sizes=True
     )
     model.to(device)
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -132,15 +210,15 @@ def train_baseline(model_name, train_loader, device):
             batch = {k: v.to(device) for k, v in batch.items()}
             output = model(**batch)
             loss = output.loss
-            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
-            
-        print(f"Epoch {epoch+1} Avg Loss: {total_loss/len(train_loader):.4f}")
+
+    # Evaluate
+    metrics = evaluate_model(model, test_loader, device, "Test (Baseline)")
+    save_metrics_to_csv(metrics, model_name, "Baseline")
 
     # Save
     clean_name = get_clean_name(model_name)
@@ -150,18 +228,15 @@ def train_baseline(model_name, train_loader, device):
 
 
 def train_contrastive_encoder(model_name, train_loader, device):
-    """
-    Supervised Contrastive Learning (Training the Encoder only)
-    """
+    """Supervised Contrastive Learning (Encoder only)"""
     print(f"\n[CONTRASTIVE ENCODER] Starting training for {model_name}...")
     
-    # Initialize Base Model (Not Classifier)
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name, config=config)
+    # Use AutoModel (Base) - No classification head
+    model = AutoModel.from_pretrained(model_name)
     model.to(device)
     
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = SupConLoss(temperature=0.07) # From losses.py
+    criterion = SupConLoss(temperature=0.07)
     
     for epoch in range(EPOCH_COUNT):
         model.train()
@@ -170,31 +245,25 @@ def train_contrastive_encoder(model_name, train_loader, device):
         
         for batch in loop:
             batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch.pop('labels') # Remove labels from input, keep for loss
+            labels = batch.pop('labels')
             
             outputs = model(**batch)
             
-            # Mean Pooling strategy (matches your script)
-            # outputs[0] is last_hidden_state
-            # shape: [bsz, seq_len, hidden_dim] -> mean -> [bsz, hidden_dim]
-            embeddings = torch.mean(outputs[0], dim=1)
+            # Robust Mean Pooling (Works for BERT, RoBERTa, and DeBERTa)
+            # last_hidden_state shape: [batch, seq_len, hidden_dim]
+            embeddings = torch.mean(outputs.last_hidden_state, dim=1)
             
-            # Normalize
+            # Normalize and Reshape for SupConLoss
             embeddings = F.normalize(embeddings, p=2, dim=1)
-            
-            # SupConLoss expects [bsz, n_views, dim]. Since n_views=1:
-            features = embeddings.unsqueeze(1)
+            features = embeddings.unsqueeze(1) # [bsz, 1, dim]
             
             loss = criterion(features, labels)
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
-
-        print(f"Epoch {epoch+1} Avg Loss: {total_loss/len(train_loader):.4f}")
 
     # Save
     clean_name = get_clean_name(model_name)
@@ -204,30 +273,25 @@ def train_contrastive_encoder(model_name, train_loader, device):
     return save_path
 
 
-def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, device):
-    """
-    Train MLP Classifier on top of Frozen Contrastive Encoder
-    """
+def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device):
+    """Train MLP Classifier on top of Frozen Contrastive Encoder"""
     print(f"\n[LAST LAYER] Training MLP on top of {encoder_path}...")
     
-    # Load the Encoder trained in the previous step
+    # Load Encoder
     encoder = AutoModel.from_pretrained(encoder_path)
     encoder.to(device)
     
     # Initialize MLP
-    # Auto-detect hidden size (usually 768, but 1024 for large models)
     hidden_size = encoder.config.hidden_size
     classifier = MLP(target_size=2, input_size=hidden_size)
     classifier.to(device)
     
-    # OPTIMIZER: Only pass classifier parameters!
-    # This implicitly "freezes" the encoder because we aren't updating its weights.
     optimizer = AdamW(classifier.parameters(), lr=LEARNING_RATE)
     loss_func = nn.CrossEntropyLoss()
     
     for epoch in range(EPOCH_COUNT):
         classifier.train()
-        encoder.train() # Keep in train mode for dropout, but no grad update
+        encoder.train() # Keep encoder in train mode (for dropout) but no grad
         total_loss = 0
         loop = tqdm(train_loader, desc=f"MLP Epoch {epoch+1}")
         
@@ -235,35 +299,25 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch.pop('labels')
             
-            # Forward pass through frozen encoder (no_grad for efficiency)
             with torch.no_grad():
                 outputs = encoder(**batch)
-                
-                # Use Pooler output if available, else Mean Pool
-                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-                    # BERT/RoBERTa usually have this
-                    features = outputs.pooler_output
-                else:
-                    # DistilBERT/Deberta might need mean pooling or CLS
-                    # Using Mean Pool to be consistent with Encoder training
-                    features = torch.mean(outputs.last_hidden_state, dim=1)
+                # Consistent Mean Pooling
+                features = torch.mean(outputs.last_hidden_state, dim=1)
 
-            # Forward pass through MLP
             logits = classifier(features)
-            
             loss = loss_func(logits, labels)
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
-            
-        print(f"Epoch {epoch+1} Avg Loss: {total_loss/len(train_loader):.4f}")
 
-    # Save ONLY the classifier state dict (or the whole thing if you prefer)
-    # Here we save the state dict as requested in your snippet
+    # Evaluate
+    metrics = evaluate_model(classifier, test_loader, device, "Test (Contrastive MLP)", is_mlp=True, encoder=encoder)
+    save_metrics_to_csv(metrics, original_model_name, "Contrastive_Last_Layer")
+
+    # Save
     clean_name = get_clean_name(original_model_name)
     save_path = os.path.join(SAVE_DIR, f"{clean_name}_contrastive_classifier_mlp.pth")
     torch.save(classifier.state_dict(), save_path)
@@ -273,8 +327,7 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
 # 4. Main Execution
 # -----------------------------
 def main():
-    # Load Data
-    texts, labels = load_data_from_databricks()
+    train_texts, train_labels, test_texts, test_labels = load_data_from_databricks()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     model_names = [
@@ -288,33 +341,35 @@ def main():
         print(f"PROCESSING MODEL: {model_name}")
         print("="*60)
 
-        # Tokenize (Fresh for each model)
+        # Tokenize
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        encodings = tokenizer(
-            texts,
-            truncation=True,
-            padding="max_length",
-            max_length=120,
-            return_tensors="pt"
-        )
         
-        # Save Tokenizer once per model family
+        def tokenize_data(texts):
+            return tokenizer(
+                texts, truncation=True, padding="max_length", max_length=120, return_tensors="pt"
+            )
+
+        train_enc = tokenize_data(train_texts)
+        test_enc = tokenize_data(test_texts)
+        
+        # Save Tokenizer
         clean_name = get_clean_name(model_name)
-        tokenizer_save_path = os.path.join(SAVE_DIR, f"{clean_name}_tokenizer")
-        tokenizer.save_pretrained(tokenizer_save_path)
+        tokenizer.save_pretrained(os.path.join(SAVE_DIR, f"{clean_name}_tokenizer"))
 
-        dataset = EMRDataset(encodings, labels)
-        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+        train_dataset = EMRDataset(train_enc, train_labels)
+        test_dataset = EMRDataset(test_enc, test_labels)
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-        # 1. Run Baseline Training
-        train_baseline(model_name, train_loader, device)
+        # 1. Run Baseline
+        train_baseline(model_name, train_loader, test_loader, device)
         
-        # 2. Run Contrastive Encoder Training
-        # We capture the path where it was saved to load it for step 3
-        encoder_save_path = train_contrastive_encoder(model_name, train_loader, device)
+        # 2. Run Contrastive Encoder
+        encoder_path = train_contrastive_encoder(model_name, train_loader, device)
         
-        # 3. Run Contrastive Last Layer (MLP) Training
-        train_contrastive_last_layer(model_name, encoder_save_path, train_loader, device)
+        # 3. Run Contrastive Last Layer
+        train_contrastive_last_layer(model_name, encoder_path, train_loader, test_loader, device)
 
     print("\nAll training runs completed.")
 
