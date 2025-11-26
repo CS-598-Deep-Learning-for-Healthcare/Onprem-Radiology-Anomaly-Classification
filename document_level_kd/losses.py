@@ -50,7 +50,7 @@ class SupConLoss(nn.Module):
         else:
             mask = mask.float().to(device)
             
-        feature_vectors_normalized = F.normalize(feature_vectors, p=2, dim=1)
+        # feature_vectors_normalized = F.normalize(feature_vectors, p=2, dim=1)
         
         
         contrast_count = features.shape[1]

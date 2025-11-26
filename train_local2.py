@@ -18,8 +18,8 @@ from document_level_kd.losses import SupConLoss
 # -----------------------------
 # Configuration
 # -----------------------------
-EPOCH_COUNT = 20
-BATCH_SIZE = 16
+EPOCH_COUNT = 1
+BATCH_SIZE = 32
 LEARNING_RATE = 4e-5
 SAVE_DIR = "./trained_models"
 
@@ -261,6 +261,9 @@ def train_contrastive_encoder(model_name, train_loader, device):
             
             optimizer.zero_grad()
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
