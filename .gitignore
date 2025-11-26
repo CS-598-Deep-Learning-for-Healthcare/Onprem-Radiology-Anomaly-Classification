@@ -2,3 +2,8 @@ mimic_cxr_data/
 .env
 mimic-cxr-reports.zip
 /emilyalsentzer
+/trained_models
+/trained_models
+/trained_models
+/document_level_kd/__pycache__
+/document_level_kd/__pycache__
