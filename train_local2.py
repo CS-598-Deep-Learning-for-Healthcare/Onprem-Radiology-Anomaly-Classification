@@ -18,7 +18,7 @@ from document_level_kd.losses import SupConLoss
 # -----------------------------
 # Configuration
 # -----------------------------
-EPOCH_COUNT = 20
+EPOCH_COUNT = 1
 BATCH_SIZE = 16
 LEARNING_RATE = 4e-5
 SAVE_DIR = "./trained_models"
