@@ -18,7 +18,7 @@ from document_level_kd.losses import SupConLoss
 # -----------------------------
 # Configuration
 # -----------------------------
-EPOCH_COUNT = 1
+EPOCH_COUNT = 20
 BATCH_SIZE = 32
 LEARNING_RATE = 4e-5
 SAVE_DIR = "./trained_models"
@@ -294,7 +294,8 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
     
     for epoch in range(EPOCH_COUNT):
         classifier.train()
-        encoder.train() # Keep encoder in train mode (for dropout) but no grad
+        # encoder.train() # Keep encoder in train mode (for dropout) but no grad
+        encoder.eval()
         total_loss = 0
         loop = tqdm(train_loader, desc=f"MLP Epoch {epoch+1}")
         
@@ -307,11 +308,13 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
                 # Consistent Mean Pooling
                 features = torch.mean(outputs.last_hidden_state, dim=1)
 
-            logits = classifier(features)
-            loss = loss_func(logits, labels)
+                features = F.normalize(features, p=2, dim=1)
+
+            logits = classifier(features) # logits are the predictions
+            loss = loss_func(logits, labels) # calculate loss from logits and labels
             
             optimizer.zero_grad()
-            loss.backward()
+            loss.backward() # loss is an object related to the classifier object that can backpropogate the classfier model
             optimizer.step()
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
@@ -334,9 +337,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     model_names = [
-        "microsoft/deberta-v3-base", 
-        "emilyalsentzer/Bio_ClinicalBERT", 
         "zzxslp/RadBERT-RoBERTa-4m"
+        "emilyalsentzer/Bio_ClinicalBERT", 
+        "microsoft/deberta-v3-base", 
     ]
 
     for model_name in model_names:
@@ -377,4 +380,4 @@ def main():
     print("\nAll training runs completed.")
 
 if __name__ == "__main__":
-    main()
+    main() 
