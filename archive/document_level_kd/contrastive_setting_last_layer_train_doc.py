@@ -106,7 +106,7 @@ def train(epoch, radbert_encoder, classifier, dataloader, optimizer, device, bat
 
 
 #### load trained encoder through contrastive setting
-model_name = "./trained_model/contrastive_encoder_document"
+model_name = "./trained_model/contrastive_encoder_document" 
 radbert_encoder = AutoModel.from_pretrained(model_name)
 model = MLP(target_size= 2, input_size= 768)
 loss_func = nn.CrossEntropyLoss()
