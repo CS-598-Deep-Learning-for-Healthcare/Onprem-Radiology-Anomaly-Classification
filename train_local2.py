@@ -11,11 +11,7 @@ from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from databricks import sql
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-
-
 from plyer import notification
-
-
 
 # Import custom loss
 from losses import SupConLoss
@@ -23,7 +19,7 @@ from losses import SupConLoss
 # -----------------------------
 # Configuration
 # -----------------------------
-EPOCH_COUNT = 5
+EPOCH_COUNT = 20
 BATCH_SIZE = 32
 LEARNING_RATE = 4e-5
 SAVE_DIR = "./trained_models"
@@ -119,59 +115,19 @@ def get_clean_name(model_path):
     """Sanitize model path for folder creation"""
     return model_path.replace("/", "_")
 
-# def evaluate_model(model, dataloader, device, split_name, is_mlp=False, encoder=None):
-#     """
-#     Generic evaluation loop for both Baseline (Full Model) and MLP (Last Layer).
-#     """
-#     model.eval()
-#     if encoder: 
-#         encoder.eval()
-    
-#     all_preds = []
-#     all_labels = []
+def get_classification_status(true_label, pred_label):
+    """Helper to return text status"""
+    if true_label == 1 and pred_label == 1: return "TP"
+    if true_label == 0 and pred_label == 1: return "FP"
+    if true_label == 1 and pred_label == 0: return "FN"
+    if true_label == 0 and pred_label == 0: return "TN"
+    return "Unknown"
 
-#     with torch.no_grad():
-#         for batch in tqdm(dataloader, desc=f"EVAL ({split_name})"):
-#             batch = {k: v.to(device) for k, v in batch.items()}
-#             labels = batch.pop('labels')
-            
-#             if is_mlp and encoder is not None:
-#                 # MLP Path: Pass through Encoder -> Mean Pool -> NORMALIZE -> MLP
-#                 outputs = encoder(**batch)
-#                 features = torch.mean(outputs.last_hidden_state, dim=1)
-                
-#                 # Apply normalization during evaluation to match training
-#                 features = F.normalize(features, p=2, dim=1)
-                
-#                 logits = model(features)
-#             else:
-#                 # Standard Baseline Path
-#                 outputs = model(**batch)
-#                 logits = outputs.logits
-
-#             batch_preds = logits.argmax(-1).detach().cpu().numpy()
-#             batch_labels = labels.detach().cpu().numpy()
-
-#             all_preds.extend(batch_preds)
-#             all_labels.extend(batch_labels)
-
-#     acc = accuracy_score(all_labels, all_preds)
-#     precision, recall, f1, _ = precision_recall_fscore_support(
-#         all_labels, all_preds, average="binary", zero_division=0
-#     )
-#     cm = confusion_matrix(all_labels, all_preds)
-#     tn, fp, fn, tp = cm.ravel()
-
-#     print(f"\n{split_name.upper()} RESULTS:")
-#     print(f"Acc: {acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
-#     print(f"CM: \n{cm}")
-
-#     return {
-#         "accuracy": acc, "precision": precision, "recall": recall, "f1": f1,
-#         "tn": tn, "fp": fp, "fn": fn, "tp": tp
-#     }
-
-def evaluate_model(model, dataloader, device, split_name, is_mlp=False, encoder=None):
+def evaluate_model(model, dataloader, device, split_name, model_name, method_tag, raw_texts=None, is_mlp=False, encoder=None):
+    """
+    Evaluation loop. 
+    Now generates a detailed predictions CSV containing the text and TP/FP status.
+    """
     model.eval()
     if encoder: 
         encoder.eval()
@@ -185,17 +141,15 @@ def evaluate_model(model, dataloader, device, split_name, is_mlp=False, encoder=
             labels = batch.pop('labels')
             
             if is_mlp and encoder is not None:
-                # --- FIX: Use Pooler Output, No Normalization ---
+                # --- Pooler Output, No Normalization (Stage 2) ---
                 outputs = encoder(**batch)
                 
                 # Check for pooler_output (BERT/RoBERTa), fall back to CLS if missing
                 if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
                     features = outputs.pooler_output
                 else:
-                    # Fallback to CLS token (index 0) if no pooler
                     features = outputs.last_hidden_state[:, 0, :]
                 
-                # REMOVED: features = F.normalize(features, p=2, dim=1)
                 logits = model(features)
             else:
                 outputs = model(**batch)
@@ -207,35 +161,65 @@ def evaluate_model(model, dataloader, device, split_name, is_mlp=False, encoder=
             all_preds.extend(batch_preds)
             all_labels.extend(batch_labels)
 
+    # 1. Calculate Metrics
     acc = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average="binary", zero_division=0
     )
     cm = confusion_matrix(all_labels, all_preds)
+    tn, fp, fn, tp = cm.ravel()
     
     print(f"\n{split_name.upper()} RESULTS:")
     print(f"Acc: {acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
+
+    # 2. Generate Detailed Predictions CSV (if raw texts are provided)
+    if raw_texts and len(raw_texts) == len(all_preds):
+        detailed_rows = []
+        for text, true, pred in zip(raw_texts, all_labels, all_preds):
+            status = get_classification_status(true, pred)
+            detailed_rows.append({
+                "text": text,
+                "prediction": pred,
+                "true_label": true,
+                "status": status  # TP, FP, TN, FN
+            })
+        
+        clean_name = get_clean_name(model_name)
+        pred_filename = f"{clean_name}_{method_tag}_predictions.csv"
+        pred_path = os.path.join(SAVE_DIR, pred_filename)
+        pd.DataFrame(detailed_rows).to_csv(pred_path, index=False)
+        print(f"Detailed predictions saved to {pred_path}")
+    else:
+        print("Warning: Raw texts not provided or length mismatch, skipping predictions CSV.")
     
     return {
-        "accuracy": acc, "precision": precision, "recall": recall, "f1": f1
+        "accuracy": acc, "precision": precision, "recall": recall, "f1": f1,
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp
     }
 
 def save_metrics_to_csv(metrics, model_name, method_tag):
-    """Saves metrics to a CSV file named based on the model family."""
+    """Saves metrics to a CSV file."""
     clean_name = get_clean_name(model_name)
     filename = f"{clean_name}_metrics.csv"
     filepath = os.path.join(SAVE_DIR, filename)
     
+    # Define exact column order requested
+    cols = [
+        "run_timestamp_utc", "model_name", "method", "num_epochs", "learning_rate",
+        "accuracy", "precision", "recall", "f1", "tn", "fp", "fn", "tp"
+    ]
+    
     row = {
         "run_timestamp_utc": datetime.utcnow().isoformat(),
         "model_name": model_name,
-        "method": method_tag, # e.g., "Baseline", "Contrastive_MLP"
+        "method": method_tag, 
         "num_epochs": EPOCH_COUNT,
         "learning_rate": LEARNING_RATE
     }
     row.update(metrics)
     
-    df = pd.DataFrame([row])
+    # Create DF with specific column order
+    df = pd.DataFrame([row], columns=cols)
     
     # Append if exists, else create new
     if os.path.exists(filepath):
@@ -249,7 +233,7 @@ def save_metrics_to_csv(metrics, model_name, method_tag):
 # 3. Training Loops
 # -----------------------------
 
-def train_baseline(model_name, train_loader, test_loader, device):
+def train_baseline(model_name, train_loader, test_loader, device, test_texts):
     """Standard Supervised Fine-Tuning"""
     print(f"\n[BASELINE] Starting training for {model_name}...")
     
@@ -274,8 +258,11 @@ def train_baseline(model_name, train_loader, test_loader, device):
             total_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
-    # Evaluate
-    metrics = evaluate_model(model, test_loader, device, "Test (Baseline)")
+    # Evaluate with raw texts passed for CSV generation
+    metrics = evaluate_model(
+        model, test_loader, device, "Test (Baseline)", 
+        model_name, "Baseline", raw_texts=test_texts
+    )
     save_metrics_to_csv(metrics, model_name, "Baseline")
 
     # Save
@@ -309,7 +296,7 @@ def train_contrastive_encoder(model_name, train_loader, device):
             # Robust Mean Pooling
             embeddings = torch.mean(outputs.last_hidden_state, dim=1)
             
-            # --- FIX: Normalize before unsqueezing for SupConLoss ---
+            # Normalize before unsqueezing for SupConLoss
             embeddings = F.normalize(embeddings, p=2, dim=1)
             features = embeddings.unsqueeze(1) # [bsz, 1, dim]
             
@@ -333,66 +320,7 @@ def train_contrastive_encoder(model_name, train_loader, device):
     return save_path
 
 
-# def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device):
-#     """Train MLP Classifier on top of Frozen Contrastive Encoder"""
-#     print(f"\n[LAST LAYER] Training MLP on top of {encoder_path}...")
-    
-#     # Load Encoder
-#     encoder = AutoModel.from_pretrained(encoder_path)
-#     encoder.to(device)
-    
-#     # Freeze encoder
-#     for p in encoder.parameters():
-#         p.requires_grad = False
-#     encoder.eval()
-    
-#     # Initialize MLP
-#     hidden_size = encoder.config.hidden_size
-#     classifier = MLP(target_size=2, input_size=hidden_size)
-#     classifier.to(device)
-    
-#     optimizer = AdamW(classifier.parameters(), lr=LEARNING_RATE)
-#     loss_func = nn.CrossEntropyLoss()
-    
-#     for epoch in range(EPOCH_COUNT):
-#         classifier.train()
-#         total_loss = 0
-#         loop = tqdm(train_loader, desc=f"MLP Epoch {epoch+1}")
-        
-#         for batch in loop:
-#             batch = {k: v.to(device) for k, v in batch.items()}
-#             labels = batch.pop('labels')
-            
-#             # Because encoder params are frozen, we don't need 'with torch.no_grad()' logic block 
-#             # (which can sometimes mess up graph connectivity if used incorrectly)
-#             with torch.no_grad():
-#                 outputs = encoder(**batch)
-#                 features = torch.mean(outputs.last_hidden_state, dim=1)
-#                 features = F.normalize(features, p=2, dim=1)
-
-#             # Features are now inputs to classifier
-#             logits = classifier(features)
-#             loss = loss_func(logits, labels)
-            
-#             optimizer.zero_grad()
-#             loss.backward() 
-#             optimizer.step()
-            
-#             total_loss += loss.item()
-#             loop.set_postfix(loss=loss.item())
-
-#     # Evaluate
-#     metrics = evaluate_model(classifier, test_loader, device, "Test (Contrastive MLP)", is_mlp=True, encoder=encoder)
-#     save_metrics_to_csv(metrics, original_model_name, "Contrastive_Last_Layer")
-
-#     # Save
-#     clean_name = get_clean_name(original_model_name)
-#     save_path = os.path.join(SAVE_DIR, f"{clean_name}_contrastive_classifier_mlp.pth")
-#     torch.save(classifier.state_dict(), save_path)
-#     print(f"[LAST LAYER] MLP Saved to {save_path}")
-
-
-def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device):
+def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device, test_texts):
     print(f"\n[LAST LAYER] Training MLP on top of {encoder_path}...")
     
     encoder = AutoModel.from_pretrained(encoder_path)
@@ -422,15 +350,11 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
             with torch.no_grad():
                 outputs = encoder(**batch)
                 
-                # --- FIX: Match Original Paper (Pooler Output) ---
                 if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
                     features = outputs.pooler_output
                 else:
                     features = outputs.last_hidden_state[:, 0, :]
                 
-                # REMOVED: F.normalize
-                # The paper does NOT normalize before the classifier in Stage 2
-
             logits = classifier(features)
             loss = loss_func(logits, labels)
             
@@ -441,7 +365,11 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
             loop.set_postfix(loss=loss.item())
 
     # Evaluate
-    metrics = evaluate_model(classifier, test_loader, device, "Test (Contrastive MLP)", is_mlp=True, encoder=encoder)
+    metrics = evaluate_model(
+        classifier, test_loader, device, "Test (Contrastive MLP)", 
+        original_model_name, "Contrastive_Last_Layer",
+        raw_texts=test_texts, is_mlp=True, encoder=encoder
+    )
     save_metrics_to_csv(metrics, original_model_name, "Contrastive_Last_Layer")
 
 # -----------------------------
@@ -481,16 +409,18 @@ def main():
         test_dataset = EMRDataset(test_enc, test_labels)
         
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        # Note: shuffle=False is critical here so predictions match the list order of test_texts
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
         # 1. Run Baseline
-        train_baseline(model_name, train_loader, test_loader, device)
+        train_baseline(model_name, train_loader, test_loader, device, test_texts)
         
         # 2. Run Contrastive Encoder
         encoder_path = train_contrastive_encoder(model_name, train_loader, device)
         
         # 3. Run Contrastive Last Layer
-        train_contrastive_last_layer(model_name, encoder_path, train_loader, test_loader, device)
+        train_contrastive_last_layer(model_name, encoder_path, train_loader, test_loader, device, test_texts)
+        
         notification.notify(
             title='Training Complete for model '+model_name,
             message='The training process for '+model_name+' has finished successfully.',
@@ -503,7 +433,7 @@ def main():
         title='Training Complete',
         message='All model training processes have finished successfully.',
         app_name='DL4H Training Script',
-        timeout=10  # Notification will disappear after 10 seconds
+        timeout=10
     )
 
 if __name__ == "__main__":
