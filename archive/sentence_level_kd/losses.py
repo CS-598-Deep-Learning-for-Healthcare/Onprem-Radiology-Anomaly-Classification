@@ -50,7 +50,7 @@ class SupConLoss(nn.Module):
         else:
             mask = mask.float().to(device)
             
-        feature_vectors_normalized = F.normalize(feature_vectors, p=2, dim=1)
+        features = F.normalize(features, p=2, dim=-1)
         
         
         contrast_count = features.shape[1]
@@ -71,7 +71,6 @@ class SupConLoss(nn.Module):
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
-        print(logits)
 
         # tile mask
         mask = mask.repeat(anchor_count, contrast_count)
