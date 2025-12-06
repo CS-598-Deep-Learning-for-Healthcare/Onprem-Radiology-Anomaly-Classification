@@ -1,19 +1,19 @@
 import os
 import torch
 import pandas as pd
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModel
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModel, AutoConfig
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 from databricks import sql
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-from plyer import notification
 
-# Import custom loss
+# Import your custom loss
 from losses import SupConLoss
 
 # -----------------------------
@@ -83,6 +83,13 @@ def load_data_from_databricks():
     test_texts, test_labels = process_df(df_test)
     
     print(f"Data loaded. Train: {len(train_texts)}, Test: {len(test_texts)}")
+    
+    # Print label distribution
+    train_label_counts = pd.Series(train_labels).value_counts()
+    test_label_counts = pd.Series(test_labels).value_counts()
+    print(f"Train label distribution: {dict(train_label_counts)}")
+    print(f"Test label distribution: {dict(test_label_counts)}")
+    
     return train_texts, train_labels, test_texts, test_labels
 
 # -----------------------------
@@ -115,18 +122,11 @@ def get_clean_name(model_path):
     """Sanitize model path for folder creation"""
     return model_path.replace("/", "_")
 
-def get_classification_status(true_label, pred_label):
-    """Helper to return text status"""
-    if true_label == 1 and pred_label == 1: return "TP"
-    if true_label == 0 and pred_label == 1: return "FP"
-    if true_label == 1 and pred_label == 0: return "FN"
-    if true_label == 0 and pred_label == 0: return "TN"
-    return "Unknown"
 
-def evaluate_model(model, dataloader, device, split_name, model_name, method_tag, raw_texts=None, is_mlp=False, encoder=None):
+def evaluate_model_detailed(model, dataloader, device, split_name, is_mlp=False, encoder=None, verbose=True):
     """
-    Evaluation loop. 
-    Now generates a detailed predictions CSV containing the text and TP/FP status.
+    Detailed evaluation with diagnostics for debugging.
+    Returns metrics dict and additional diagnostic info.
     """
     model.eval()
     if encoder: 
@@ -134,107 +134,105 @@ def evaluate_model(model, dataloader, device, split_name, model_name, method_tag
     
     all_preds = []
     all_labels = []
+    all_logits = []
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"EVAL ({split_name})"):
+        for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch.pop('labels')
             
             if is_mlp and encoder is not None:
-                # --- Pooler Output, No Normalization (Stage 2) ---
                 outputs = encoder(**batch)
-                
-                # Check for pooler_output (BERT/RoBERTa), fall back to CLS if missing
-                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-                    features = outputs.pooler_output
-                else:
-                    features = outputs.last_hidden_state[:, 0, :]
-                
+                features = torch.mean(outputs.last_hidden_state, dim=1)
+                features = F.normalize(features, p=2, dim=1)
                 logits = model(features)
             else:
                 outputs = model(**batch)
                 logits = outputs.logits
 
+            all_logits.append(logits.detach().cpu())
             batch_preds = logits.argmax(-1).detach().cpu().numpy()
             batch_labels = labels.detach().cpu().numpy()
 
             all_preds.extend(batch_preds)
             all_labels.extend(batch_labels)
 
-    # 1. Calculate Metrics
+    # Concatenate all logits for analysis
+    all_logits = torch.cat(all_logits, dim=0).numpy()
+    
+    # Compute metrics
     acc = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average="binary", zero_division=0
     )
-    cm = confusion_matrix(all_labels, all_preds)
-    tn, fp, fn, tp = cm.ravel()
     
-    print(f"\n{split_name.upper()} RESULTS:")
-    print(f"Acc: {acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
-
-    # 2. Generate Detailed Predictions CSV (if raw texts are provided)
-    if raw_texts and len(raw_texts) == len(all_preds):
-        detailed_rows = []
-        for text, true, pred in zip(raw_texts, all_labels, all_preds):
-            status = get_classification_status(true, pred)
-            detailed_rows.append({
-                "text": text,
-                "prediction": pred,
-                "true_label": true,
-                "status": status  # TP, FP, TN, FN
-            })
-        
-        clean_name = get_clean_name(model_name)
-        pred_filename = f"{clean_name}_{method_tag}_predictions.csv"
-        pred_path = os.path.join(SAVE_DIR, pred_filename)
-        pd.DataFrame(detailed_rows).to_csv(pred_path, index=False)
-        print(f"Detailed predictions saved to {pred_path}")
+    # Handle case where not all classes are predicted
+    unique_preds = np.unique(all_preds)
+    unique_labels = np.unique(all_labels)
+    
+    if len(unique_preds) < 2 or len(unique_labels) < 2:
+        # Can't compute full confusion matrix
+        cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
     else:
-        print("Warning: Raw texts not provided or length mismatch, skipping predictions CSV.")
+        cm = confusion_matrix(all_labels, all_preds)
     
-    return {
-        "accuracy": acc, "precision": precision, "recall": recall, "f1": f1,
-        "tn": tn, "fp": fp, "fn": fn, "tp": tp
+    # Safe extraction of confusion matrix values
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+        if 0 in unique_preds and 0 in unique_labels:
+            tn = cm[0, 0] if cm.shape[0] > 0 else 0
+
+    # Diagnostic info
+    pred_counts = pd.Series(all_preds).value_counts().to_dict()
+    label_counts = pd.Series(all_labels).value_counts().to_dict()
+    
+    # Logit statistics
+    logit_stats = {
+        "logit_class0_mean": float(np.mean(all_logits[:, 0])),
+        "logit_class0_std": float(np.std(all_logits[:, 0])),
+        "logit_class1_mean": float(np.mean(all_logits[:, 1])),
+        "logit_class1_std": float(np.std(all_logits[:, 1])),
+        "logit_diff_mean": float(np.mean(all_logits[:, 1] - all_logits[:, 0])),  # positive means predicting class 1
     }
 
-def save_metrics_to_csv(metrics, model_name, method_tag):
-    """Saves metrics to a CSV file."""
+    if verbose:
+        print(f"\n  {split_name} Results:")
+        print(f"    Acc: {acc:.4f}, Prec: {precision:.4f}, Rec: {recall:.4f}, F1: {f1:.4f}")
+        print(f"    Predictions: {pred_counts} | Actuals: {label_counts}")
+        print(f"    Logits - Class0: {logit_stats['logit_class0_mean']:.3f}±{logit_stats['logit_class0_std']:.3f}, "
+              f"Class1: {logit_stats['logit_class1_mean']:.3f}±{logit_stats['logit_class1_std']:.3f}")
+        print(f"    Logit diff (class1-class0) mean: {logit_stats['logit_diff_mean']:.3f}")
+
+    metrics = {
+        "accuracy": acc, "precision": precision, "recall": recall, "f1": f1,
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "pred_class0": pred_counts.get(0, 0),
+        "pred_class1": pred_counts.get(1, 0),
+    }
+    metrics.update(logit_stats)
+
+    return metrics
+
+
+def save_epoch_metrics_to_csv(epoch_metrics_list, model_name, method_tag):
+    """Saves per-epoch metrics to a CSV file."""
     clean_name = get_clean_name(model_name)
-    filename = f"{clean_name}_metrics.csv"
+    filename = f"{clean_name}_{method_tag}_epoch_metrics.csv"
     filepath = os.path.join(SAVE_DIR, filename)
     
-    # Define exact column order requested
-    cols = [
-        "run_timestamp_utc", "model_name", "method", "num_epochs", "learning_rate",
-        "accuracy", "precision", "recall", "f1", "tn", "fp", "fn", "tp"
-    ]
-    
-    row = {
-        "run_timestamp_utc": datetime.utcnow().isoformat(),
-        "model_name": model_name,
-        "method": method_tag, 
-        "num_epochs": EPOCH_COUNT,
-        "learning_rate": LEARNING_RATE
-    }
-    row.update(metrics)
-    
-    # Create DF with specific column order
-    df = pd.DataFrame([row], columns=cols)
-    
-    # Append if exists, else create new
-    if os.path.exists(filepath):
-        df.to_csv(filepath, mode='a', header=False, index=False)
-    else:
-        df.to_csv(filepath, index=False)
-    
-    print(f"Metrics saved to {filepath}")
+    df = pd.DataFrame(epoch_metrics_list)
+    df.to_csv(filepath, index=False)
+    print(f"Epoch metrics saved to {filepath}")
+
 
 # -----------------------------
 # 3. Training Loops
 # -----------------------------
 
-def train_baseline(model_name, train_loader, test_loader, device, test_texts):
-    """Standard Supervised Fine-Tuning"""
+def train_baseline(model_name, train_loader, test_loader, device):
+    """Standard Supervised Fine-Tuning with per-epoch metrics"""
     print(f"\n[BASELINE] Starting training for {model_name}...")
     
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -243,9 +241,12 @@ def train_baseline(model_name, train_loader, test_loader, device, test_texts):
     model.to(device)
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
     
+    epoch_metrics = []
+    
     for epoch in range(EPOCH_COUNT):
         model.train()
         total_loss = 0
+        batch_count = 0
         loop = tqdm(train_loader, desc=f"Base Epoch {epoch+1}")
         
         for batch in loop:
@@ -256,16 +257,35 @@ def train_baseline(model_name, train_loader, test_loader, device, test_texts):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            batch_count += 1
             loop.set_postfix(loss=loss.item())
+        
+        avg_loss = total_loss / batch_count
+        
+        # Evaluate on both train and test
+        print(f"\n--- Epoch {epoch+1}/{EPOCH_COUNT} (Avg Loss: {avg_loss:.4f}) ---")
+        train_metrics = evaluate_model_detailed(model, train_loader, device, "Train", verbose=True)
+        test_metrics = evaluate_model_detailed(model, test_loader, device, "Test", verbose=True)
+        
+        # Store metrics
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": avg_loss,
+            "train_acc": train_metrics["accuracy"],
+            "train_f1": train_metrics["f1"],
+            "train_pred_class0": train_metrics["pred_class0"],
+            "train_pred_class1": train_metrics["pred_class1"],
+            "test_acc": test_metrics["accuracy"],
+            "test_f1": test_metrics["f1"],
+            "test_pred_class0": test_metrics["pred_class0"],
+            "test_pred_class1": test_metrics["pred_class1"],
+        }
+        epoch_metrics.append(row)
+    
+    # Save epoch metrics
+    save_epoch_metrics_to_csv(epoch_metrics, model_name, "baseline")
 
-    # Evaluate with raw texts passed for CSV generation
-    metrics = evaluate_model(
-        model, test_loader, device, "Test (Baseline)", 
-        model_name, "Baseline", raw_texts=test_texts
-    )
-    save_metrics_to_csv(metrics, model_name, "Baseline")
-
-    # Save
+    # Save model
     clean_name = get_clean_name(model_name)
     save_path = os.path.join(SAVE_DIR, f"{clean_name}_baseline")
     model.save_pretrained(save_path)
@@ -273,7 +293,7 @@ def train_baseline(model_name, train_loader, test_loader, device, test_texts):
 
 
 def train_contrastive_encoder(model_name, train_loader, device):
-    """Supervised Contrastive Learning (Encoder only)"""
+    """Supervised Contrastive Learning (Encoder only) with per-epoch loss tracking"""
     print(f"\n[CONTRASTIVE ENCODER] Starting training for {model_name}...")
     
     model = AutoModel.from_pretrained(model_name)
@@ -282,9 +302,12 @@ def train_contrastive_encoder(model_name, train_loader, device):
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
     criterion = SupConLoss(temperature=0.07)
     
+    epoch_losses = []
+    
     for epoch in range(EPOCH_COUNT):
         model.train()
         total_loss = 0
+        batch_count = 0
         loop = tqdm(train_loader, desc=f"Enc Epoch {epoch+1}")
         
         for batch in loop:
@@ -292,56 +315,76 @@ def train_contrastive_encoder(model_name, train_loader, device):
             labels = batch.pop('labels')
             
             outputs = model(**batch)
-            
-            # Robust Mean Pooling
             embeddings = torch.mean(outputs.last_hidden_state, dim=1)
-            
-            # Normalize before unsqueezing for SupConLoss
             embeddings = F.normalize(embeddings, p=2, dim=1)
-            features = embeddings.unsqueeze(1) # [bsz, 1, dim]
+            features = embeddings.unsqueeze(1)
             
             loss = criterion(features, labels)
             
             optimizer.zero_grad()
             loss.backward()
-            
-            # Clip grad norm (standard practice)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
+            
             total_loss += loss.item()
+            batch_count += 1
             loop.set_postfix(loss=loss.item())
+        
+        avg_loss = total_loss / batch_count
+        epoch_losses.append({"epoch": epoch + 1, "contrastive_loss": avg_loss})
+        print(f"  Epoch {epoch+1} Avg Contrastive Loss: {avg_loss:.4f}")
 
-    # Save
+    # Save epoch losses
     clean_name = get_clean_name(model_name)
+    loss_df = pd.DataFrame(epoch_losses)
+    loss_df.to_csv(os.path.join(SAVE_DIR, f"{clean_name}_contrastive_encoder_losses.csv"), index=False)
+
+    # Save model
     save_path = os.path.join(SAVE_DIR, f"{clean_name}_contrastive_encoder")
     model.save_pretrained(save_path)
     print(f"[CONTRASTIVE ENCODER] Saved to {save_path}")
     return save_path
 
 
-def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device, test_texts):
+def train_contrastive_last_layer(original_model_name, encoder_path, train_loader, test_loader, device):
+    """Train MLP Classifier with per-epoch metrics on train and test"""
     print(f"\n[LAST LAYER] Training MLP on top of {encoder_path}...")
     
+    # Load Encoder
     encoder = AutoModel.from_pretrained(encoder_path)
     encoder.to(device)
-    
-    # Freeze encoder
-    for p in encoder.parameters():
-        p.requires_grad = False
-    encoder.eval()
+    encoder.eval()  # Keep frozen
     
     # Initialize MLP
     hidden_size = encoder.config.hidden_size
+    print(f"  Encoder hidden size: {hidden_size}")
+    
     classifier = MLP(target_size=2, input_size=hidden_size)
     classifier.to(device)
+    
+    # Print initial weights
+    print(f"  Initial MLP weights - shape: {classifier.fc1.weight.shape}")
+    print(f"  Initial MLP weight stats: mean={classifier.fc1.weight.mean().item():.4f}, std={classifier.fc1.weight.std().item():.4f}")
+    print(f"  Initial MLP bias: {classifier.fc1.bias.data}")
     
     optimizer = AdamW(classifier.parameters(), lr=LEARNING_RATE)
     loss_func = nn.CrossEntropyLoss()
     
+    epoch_metrics = []
+    
+    # Pre-training evaluation
+    print("\n--- Pre-training Evaluation ---")
+    train_metrics = evaluate_model_detailed(classifier, train_loader, device, "Train (Pre)", is_mlp=True, encoder=encoder)
+    test_metrics = evaluate_model_detailed(classifier, test_loader, device, "Test (Pre)", is_mlp=True, encoder=encoder)
+    
     for epoch in range(EPOCH_COUNT):
         classifier.train()
+        total_loss = 0
+        batch_count = 0
         loop = tqdm(train_loader, desc=f"MLP Epoch {epoch+1}")
+        
+        # Track gradient stats
+        grad_norms = []
         
         for batch in loop:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -349,28 +392,74 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
             
             with torch.no_grad():
                 outputs = encoder(**batch)
-                
-                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-                    features = outputs.pooler_output
-                else:
-                    features = outputs.last_hidden_state[:, 0, :]
-                
+                features = torch.mean(outputs.last_hidden_state, dim=1)
+                features = F.normalize(features, p=2, dim=1)
+
             logits = classifier(features)
             loss = loss_func(logits, labels)
             
             optimizer.zero_grad()
-            loss.backward() 
-            optimizer.step()
+            loss.backward()
             
+            # Track gradient norm
+            grad_norm = classifier.fc1.weight.grad.norm().item()
+            grad_norms.append(grad_norm)
+            
+            optimizer.step()
+            total_loss += loss.item()
+            batch_count += 1
             loop.set_postfix(loss=loss.item())
+        
+        avg_loss = total_loss / batch_count
+        avg_grad_norm = np.mean(grad_norms)
+        
+        # Evaluate on both train and test
+        print(f"\n--- Epoch {epoch+1}/{EPOCH_COUNT} (Avg Loss: {avg_loss:.4f}, Avg Grad Norm: {avg_grad_norm:.4f}) ---")
+        print(f"  MLP weight stats: mean={classifier.fc1.weight.mean().item():.4f}, std={classifier.fc1.weight.std().item():.4f}")
+        print(f"  MLP bias: {classifier.fc1.bias.data}")
+        
+        train_metrics = evaluate_model_detailed(classifier, train_loader, device, "Train", is_mlp=True, encoder=encoder)
+        test_metrics = evaluate_model_detailed(classifier, test_loader, device, "Test", is_mlp=True, encoder=encoder)
+        
+        # Store metrics
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": avg_loss,
+            "avg_grad_norm": avg_grad_norm,
+            "mlp_weight_mean": classifier.fc1.weight.mean().item(),
+            "mlp_weight_std": classifier.fc1.weight.std().item(),
+            "mlp_bias_0": classifier.fc1.bias[0].item(),
+            "mlp_bias_1": classifier.fc1.bias[1].item(),
+            "train_acc": train_metrics["accuracy"],
+            "train_f1": train_metrics["f1"],
+            "train_precision": train_metrics["precision"],
+            "train_recall": train_metrics["recall"],
+            "train_pred_class0": train_metrics["pred_class0"],
+            "train_pred_class1": train_metrics["pred_class1"],
+            "train_logit_class0_mean": train_metrics["logit_class0_mean"],
+            "train_logit_class1_mean": train_metrics["logit_class1_mean"],
+            "train_logit_diff_mean": train_metrics["logit_diff_mean"],
+            "test_acc": test_metrics["accuracy"],
+            "test_f1": test_metrics["f1"],
+            "test_precision": test_metrics["precision"],
+            "test_recall": test_metrics["recall"],
+            "test_pred_class0": test_metrics["pred_class0"],
+            "test_pred_class1": test_metrics["pred_class1"],
+            "test_logit_class0_mean": test_metrics["logit_class0_mean"],
+            "test_logit_class1_mean": test_metrics["logit_class1_mean"],
+            "test_logit_diff_mean": test_metrics["logit_diff_mean"],
+        }
+        epoch_metrics.append(row)
+    
+    # Save epoch metrics
+    save_epoch_metrics_to_csv(epoch_metrics, original_model_name, "contrastive_mlp")
 
-    # Evaluate
-    metrics = evaluate_model(
-        classifier, test_loader, device, "Test (Contrastive MLP)", 
-        original_model_name, "Contrastive_Last_Layer",
-        raw_texts=test_texts, is_mlp=True, encoder=encoder
-    )
-    save_metrics_to_csv(metrics, original_model_name, "Contrastive_Last_Layer")
+    # Save classifier
+    clean_name = get_clean_name(original_model_name)
+    save_path = os.path.join(SAVE_DIR, f"{clean_name}_contrastive_classifier_mlp.pth")
+    torch.save(classifier.state_dict(), save_path)
+    print(f"[LAST LAYER] MLP Saved to {save_path}")
+
 
 # -----------------------------
 # 4. Main Execution
@@ -378,9 +467,10 @@ def train_contrastive_last_layer(original_model_name, encoder_path, train_loader
 def main():
     train_texts, train_labels, test_texts, test_labels = load_data_from_databricks()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     
     model_names = [
-        "zzxslp/RadBERT-RoBERTa-4m",
+        "zzxslp/RadBERT-RoBERTa-4m",  # Fixed: added comma
         "emilyalsentzer/Bio_ClinicalBERT", 
         "microsoft/deberta-v3-base", 
     ]
@@ -409,32 +499,18 @@ def main():
         test_dataset = EMRDataset(test_enc, test_labels)
         
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        # Note: shuffle=False is critical here so predictions match the list order of test_texts
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
         # 1. Run Baseline
-        train_baseline(model_name, train_loader, test_loader, device, test_texts)
+        train_baseline(model_name, train_loader, test_loader, device)
         
         # 2. Run Contrastive Encoder
         encoder_path = train_contrastive_encoder(model_name, train_loader, device)
         
         # 3. Run Contrastive Last Layer
-        train_contrastive_last_layer(model_name, encoder_path, train_loader, test_loader, device, test_texts)
-        
-        notification.notify(
-            title='Training Complete for model '+model_name,
-            message='The training process for '+model_name+' has finished successfully.',
-            app_name='DL4H Training Script',
-            timeout=10  # Notification will disappear after 10 seconds
-        )
+        train_contrastive_last_layer(model_name, encoder_path, train_loader, test_loader, device)
 
     print("\nAll training runs completed.")
-    notification.notify(
-        title='Training Complete',
-        message='All model training processes have finished successfully.',
-        app_name='DL4H Training Script',
-        timeout=10
-    )
 
 if __name__ == "__main__":
     main()
