@@ -2,7 +2,7 @@
 
 ## 📖 Citation
 
-If you use this repository in your research, please cite:
+Original paper:
 
 ```bibtex
 @InProceedings{kim2024integrating,
