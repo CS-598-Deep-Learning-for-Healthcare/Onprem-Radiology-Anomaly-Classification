@@ -1,14 +1,30 @@
-mimic_cxr_data/
+# ===== Virtual Environments =====
+.venv/
 .env
-.venv
+
+# ===== Python Cache =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Large Datasets & Artifacts =====
+mimic_cxr_data/
 mimic-cxr-reports.zip
-/emilyalsentzer
-/trained_models
-/trained_models
-/trained_models
-/document_level_kd/__pycache__
-/document_level_kd/__pycache__
+
+# ===== Trained Models =====
+trained_models/
+
+# ===== Experiment Outputs =====
 evaluation_results.csv
 text.txt
-__pycache__
-.ipynb_checkpoints
+
+# ===== External / Retrieved Repos =====
+emilyalsentzer/
+
+# ===== OS / IDE Noise =====
+.DS_Store
+.vscode/
+.idea/
