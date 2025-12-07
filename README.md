@@ -1,4 +1,4 @@
-# Integrating ChatGPT into Secure Hospital Networks: A Case Study on Improving Radiology Report Analysis - A re-implementation
+# A Reimplementation of Integrating ChatGPT into Secure Hospital Networks: A Case Study on Improving Radiology Report Analysis - A re-implementation
 
 ## Project Presentation
 
