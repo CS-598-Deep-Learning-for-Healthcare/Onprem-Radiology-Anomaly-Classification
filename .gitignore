@@ -1,5 +1,6 @@
 mimic_cxr_data/
 .env
+.venv
 mimic-cxr-reports.zip
 /emilyalsentzer
 /trained_models
@@ -9,3 +10,5 @@ mimic-cxr-reports.zip
 /document_level_kd/__pycache__
 evaluation_results.csv
 text.txt
+__pycache__
+.ipynb_checkpoints
